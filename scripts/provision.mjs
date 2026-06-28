@@ -86,10 +86,14 @@ function provisionNpm(id, entry, sandbox) {
     JSON.stringify({ name: `sandbox-${id}`, private: true, version: "0.0.0" }, null, 2),
   )
   // Install the CLI (its bin lands in node_modules/.bin) plus the matching library.
+  // constructs floor MUST satisfy the lib's peer (cdktn@next → ^10.6.0; cdktf 0.21 →
+  // ^10.4.2). With ^10.0.0 some npm builds floor-pin to 10.0.0 and ERESOLVE against
+  // cdktn's ^10.6.0 peer (observed on the Windows runner; ubuntu/macOS picked latest
+  // 10.x and passed). ^10.6.0 makes the floor itself satisfy the peer on every npm.
   sh(NPM, ["install", "--no-fund", "--no-audit",
     `${entry.cliPackage}@${entry.cliSpec}`,
     `${entry.libPackage}@${entry.libSpec}`,
-    "constructs@^10.0.0"], sandbox)
+    "constructs@^10.6.0"], sandbox)
 
   const installed = readInstalledVersion(sandbox, entry.cliPackage)
   const libVersion = readInstalledVersion(sandbox, entry.libPackage)
@@ -212,7 +216,7 @@ async function provisionMonorepo(id, entry, sandbox) {
     // cdktn-cli peer-deps cdktn@0.0.0; legacy-peer-deps avoids ERESOLVE.
     writeRegistryNpmrc(sandbox, registry)
     await shAsync(NPM, ["install", "--no-fund", "--no-audit",
-      "cdktn-cli", entry.libPackage, "constructs@^10.0.0"], sandbox)
+      "cdktn-cli", entry.libPackage, "constructs@^10.6.0"], sandbox)
   } catch (err) {
     await registry.close()
     throw err
