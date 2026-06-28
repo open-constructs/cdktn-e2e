@@ -45,7 +45,12 @@ jobs:
           FORCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '1' || '0' }}
         run: node scripts/check-new-preview.mjs
       - id: ids
-        run: echo "cli_ids=${{ inputs.cli_ids || 'cdktn-next cdktn-latest' }}" >> "$GITHUB_OUTPUT"
+        # Pass the dispatch input via env (not direct ${{ }} interpolation into the
+        # run script) so an operator-supplied value can't inject shell — zizmor
+        # template-injection. Identical output for normal inputs.
+        env:
+          CLI_IDS: ${{ inputs.cli_ids || 'cdktn-next cdktn-latest' }}
+        run: echo "cli_ids=$CLI_IDS" >> "$GITHUB_OUTPUT"
 
   e2e:
     needs: decide
@@ -223,9 +228,13 @@ jobs:
         env:
           V: ${{ needs.decide.outputs.next_version }}
       - name: Commit
+        # next_version via env (not ${{ }} in the run script) so it can't inject
+        # shell through the commit message — zizmor template-injection.
+        env:
+          V: ${{ needs.decide.outputs.next_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state/last-tested.json
-          git commit -m "chore: record tested preview ${{ needs.decide.outputs.next_version }}" || echo "no change"
+          git commit -m "chore: record tested preview $V" || echo "no change"
           git push
