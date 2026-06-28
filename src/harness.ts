@@ -177,6 +177,16 @@ export async function runPiped(args: {
   })
 }
 
+/** Poll a predicate until true or timeout. Returns whether it became true. */
+export async function until(pred: () => boolean, ms = 60_000, stepMs = 150): Promise<boolean> {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    if (pred()) return true
+    await new Promise((r) => setTimeout(r, stepMs))
+  }
+  return false
+}
+
 /** Parse termless `exitInfo` ("exit=<code>" | null) into a numeric code, or null. */
 export function exitCodeOf(info: string | null): number | null {
   const m = info?.match(/^exit=(-?\d+)$/)

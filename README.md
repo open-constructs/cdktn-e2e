@@ -35,53 +35,43 @@ show up as the same assertion flipping:
 ## Quick start
 
 ```bash
-mise install                  # Node 24 (.nvmrc; termless needs >=23.6.0) + terraform 1.7.5
-pnpm install
-# (mise.toml pins terraform 1.7.5; or `brew install terraform` / setup-terraform in CI)
-
-# Provision a CLI into .sandboxes/<id>/ (installs the binary + matching library + fixtures)
-pnpm provision cdktn-next
-
-# Run the suite against it
-CLI_ID=cdktn-next pnpm test
-
-# If mise isn't activated in your shell, prefix commands: `mise exec -- pnpm test`
-
-# Compare channels
-pnpm provision cdktn-latest cdktf-prefork
-CLI_ID=cdktn-latest   pnpm test
-CLI_ID=cdktf-prefork  pnpm test
+mise install                       # Node 24 + terraform 1.7.5
+pnpm install                       # postinstall fixes node-pty's spawn-helper bit
+pnpm provision cdktn-next          # install a CLI into .sandboxes/cdktn-next/
+CLI_ID=cdktn-next pnpm test        # run the suite against it
 ```
 
-### Validate an unmerged PR locally
+Validate an unmerged PR head (builds the monorepo via an in-process Verdaccio so all
+workspace packages are the PR's code):
 
 ```bash
-CDKTN_MONOREPO=../cdk-terrain pnpm provision cdktn-prhead   # builds + packs cdktn-cli from the checkout
+CDKTN_MONOREPO=../cdk-terrain pnpm provision cdktn-prhead
 CLI_ID=cdktn-prhead pnpm test
 ```
+
+→ **[guides/running-tests.md](./guides/running-tests.md)** — provisioning each channel,
+single tests, the manual Ctrl-C runbook, the #283 lock tests, and troubleshooting.
 
 ## Layout
 
 ```
 src/
-  versions.ts     # the CLI version matrix
-  provision …     # (scripts/) installs a CLI into .sandboxes/<id>/ + writes manifest.json
-  manifest.ts     # tests read provisioned bin paths from here (no network at test time)
-  harness.ts      # spawnCli(), waitExit(), TTY_ENV / NONTTY_ENV
-  setup.ts        # matcher registration + SVG-screenshot-on-failure
-  tf-http-backend.ts  # in-process Terraform HTTP backend mock (state lock testing, issue #283)
-fixtures/
-  minimal-ts/     # single provider-free stack (local backend)
-  multi-stack-ts/ # infra→app dependency edge (deploy router: dismiss/stop)
-  locking-http-ts/# http backend → the mock, for lock-release tests
-tests/            # smoke, tty-render, deploy-approve, non-tty, synth-golden, ctrl-c-teardown
+  versions.ts          # the CLI version matrix
+  manifest.ts          # tests read provisioned bin paths here (no network at test time)
+  harness.ts           # spawnCli(), runPiped(), waitExit(), until(), TTY_ENV/NONTTY_ENV
+  setup.ts             # matcher registration + SVG-screenshot-on-failure
+  tf-http-backend.ts   # in-process Terraform HTTP backend mock (state-lock observation)
+  raw-terraform.ts     # drive a raw terraform binary (the #283 SIGKILL positive control)
+fixtures/              # minimal-ts, multi-stack-ts, locking-http-ts, provider-list-ts
+tests/                 # smoke, tty-render, deploy-approve, non-tty, synth-golden, ctrl-c-teardown
 scripts/
-  provision.mjs        # install/build a CLI under test
+  provision.mjs        # install/build a CLI into .sandboxes/<id>/ (+ Verdaccio for prhead)
   check-new-preview.mjs # cron diff-detection (skip when @next hasn't moved)
-.github/workflows/
-  nightly.yml          # cron + manual dispatch + diff-detection
-  pr-validation.yml    # on-demand PR-head validation
+  report-issue.mjs     # open/update/close a dedup'd GitHub issue from a run
+  step-summary.mjs     # per-run pass/fail table → GitHub step summary
+  manual-verify.mjs    # human Ctrl-C runbook (ground-truth backstop)
+.github/workflows/     # nightly.yml (cron + diff-detection + issue reporting), pr-validation.yml
 ```
 
-See [DESIGN.md](./DESIGN.md) for the architecture, rationale, and the regression
-targets this suite is built to catch.
+See **[DESIGN.md](./DESIGN.md)** for architecture, rationale, the run-once CI policy,
+and the validation findings.

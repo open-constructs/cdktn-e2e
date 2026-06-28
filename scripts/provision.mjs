@@ -9,36 +9,44 @@
 //
 // Strategy per kind:
 //   npm      → install <cliPackage>@<cliSpec> into the sandbox, capture the bin.
-//   monorepo → `pnpm pack` cdktn-cli from a local checkout, install the tarball.
+//   monorepo → build the full cdk-terrain monorepo, publish every dist/js/*.tgz
+//              to an in-process Verdaccio registry, then install cdktn-cli (and
+//              the cdktn lib for fixtures) from it. Because every workspace
+//              package is published at its real 0.0.0, the PR head is exercised
+//              with full fidelity across ALL packages — not just cdktn-cli.
 // Fixtures are copied in and their __FRAMEWORK__/__LIB_SPEC__ placeholders are
 // filled to match the CLI, then their deps installed so `synth` can run.
 
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import {
   cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
-  renameSync,
   readdirSync,
 } from "node:fs"
+import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { runServer } from "verdaccio"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, "..")
 const SANDBOX_ROOT = join(ROOT, ".sandboxes")
 const FIXTURES_SRC = join(ROOT, "fixtures")
-const FIXTURES = ["minimal-ts", "multi-stack-ts", "locking-http-ts"]
+const FIXTURES = ["minimal-ts", "multi-stack-ts", "locking-http-ts", "provider-list-ts"]
 
 // Minimal mirror of src/versions.ts (kept in JS so this script needs no build).
 const MATRIX = {
   "cdktf-prefork": { kind: "npm", cliPackage: "cdktf-cli", cliSpec: "0.21.0", bin: "cdktf", libPackage: "cdktf", libSpec: "0.21.0" },
   "cdktn-latest":  { kind: "npm", cliPackage: "cdktn-cli", cliSpec: "latest", bin: "cdktn", libPackage: "cdktn", libSpec: "latest" },
   "cdktn-next":    { kind: "npm", cliPackage: "cdktn-cli", cliSpec: "next",   bin: "cdktn", libPackage: "cdktn", libSpec: "next" },
-  "cdktn-prhead":  { kind: "monorepo", bin: "cdktn", libPackage: "cdktn", libSpec: "next" },
+  // libSpec "latest": Verdaccio serves the only published version (0.0.0) as
+  // `latest`, so the fixtures' `cdktn` resolves to the local PR-head build.
+  "cdktn-prhead":  { kind: "monorepo", bin: "cdktn", libPackage: "cdktn", libSpec: "latest" },
 }
 
 // On Windows, npm/pnpm are .cmd shims that execFileSync can't resolve bare.
@@ -48,6 +56,19 @@ const PNPM = isWin ? "pnpm.cmd" : "pnpm"
 
 const sh = (cmd, args, cwd) =>
   execFileSync(cmd, args, { cwd, stdio: "inherit", env: process.env, shell: isWin })
+
+// Async variant: REQUIRED for any child process that talks to the in-process
+// Verdaccio (publish, installs while the registry is up). A synchronous
+// execFileSync would block this script's event loop, starving the Verdaccio
+// HTTP server in the same process and deadlocking the request.
+const shAsync = (cmd, args, cwd) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, stdio: "inherit", env: process.env, shell: isWin })
+    child.once("error", reject)
+    child.once("exit", (code) =>
+      code === 0 ? resolve() : reject(new Error(`${cmd} ${args.join(" ")} exited with code ${code}`)),
+    )
+  })
 
 /** Resolve a package's bin entry to its absolute JS file (spawned as `node <file>`). */
 function resolveBinJs(sandbox, cliPackage, binName) {
@@ -75,47 +96,148 @@ function provisionNpm(id, entry, sandbox) {
   return { version: installed, libVersion }
 }
 
-function provisionMonorepo(id, entry, sandbox) {
+// Resolve the mise binary so subprocesses run under the monorepo's OWN toolchain
+// (its mise.toml + .nvmrc pin go/java/node-22). `command -v mise` from a login
+// shell is unavailable to execFileSync, so probe the known Homebrew path first.
+function miseBin() {
+  for (const c of ["/opt/homebrew/bin/mise", "/usr/local/bin/mise"]) {
+    if (existsSync(c)) return c
+  }
+  return "mise" // fall back to PATH
+}
+
+// Run a command inside the monorepo under its mise toolchain. cwd=<repo> makes
+// mise pick up that repo's mise.toml/.nvmrc (node 22), independent of the host
+// e2e toolchain (node 24) this script runs under.
+function runInMonorepo(repo, args) {
+  execFileSync(miseBin(), ["exec", "--", ...args], {
+    cwd: repo,
+    stdio: "inherit",
+    env: process.env,
+  })
+}
+
+/**
+ * Boot an in-process Verdaccio registry on an ephemeral port. cdktn** / @cdktn/*
+ * are served WITHOUT a proxy so the locally-published 0.0.0 wins; everything else
+ * proxies npmjs. Storage is a fresh temp dir, cleaned on close.
+ *
+ * @returns {Promise<{url:string, port:number, authArg:string, close:()=>Promise<void>}>}
+ */
+async function startRegistry(id) {
+  const dir = mkdtempSync(join(tmpdir(), `cdktn-verdaccio-${id}-`))
+  const config = {
+    // Required by @verdaccio/config even for an object config; used only to
+    // resolve relative paths (storage is absolute, so the value is inert).
+    configPath: join(dir, "config.yaml"),
+    storage: join(dir, "storage"),
+    max_body_size: "100mb",
+    web: { enable: false },
+    self_update: false,
+    // htpasswd auth plugin (publishes are anonymous via $all, but verdaccio
+    // expects an auth plugin to be configured).
+    auth: { htpasswd: { file: join(dir, "htpasswd") } },
+    uplinks: { npmjs: { url: "https://registry.npmjs.org/" } },
+    packages: {
+      // No proxy → local 0.0.0 wins.
+      "cdktn**": { access: "$all", publish: "$all", unpublish: "$all" },
+      "@cdktn/*": { access: "$all", publish: "$all", unpublish: "$all" },
+      // Everything else (constructs, tsx, jsii deps, …) proxies npmjs.
+      "**": { access: "$all", publish: "$all", unpublish: "$all", proxy: "npmjs" },
+    },
+    log: { type: "stdout", format: "pretty", level: "warn" },
+  }
+  const app = await runServer(config)
+  // Bind explicitly to 127.0.0.1 (IPv4). The default `listen(0)` binds IPv6
+  // `::`, which the npm client fails to reach (its fetch agent hangs), so npm
+  // would time out talking to the registry.
+  const server = await new Promise((res, rej) => {
+    const s = app.listen(0, "127.0.0.1", () => res(s)) // port 0 → OS picks a free port
+    s.once("error", rej)
+  })
+  const port = server.address().port
+  const url = `http://127.0.0.1:${port}/`
+  // npm refuses to publish (ENEEDAUTH) without a token for the target registry
+  // even though Verdaccio allows anonymous publish — pass a dummy one inline.
+  const authArg = `--//127.0.0.1:${port}/:_authToken=dummy`
+  return {
+    url,
+    port,
+    authArg,
+    close: async () => {
+      await new Promise((r) => server.close(() => r()))
+      rmSync(dir, { recursive: true, force: true })
+    },
+  }
+}
+
+async function provisionMonorepo(id, entry, sandbox) {
   const repo = entry.monorepoPath || process.env.CDKTN_MONOREPO
   if (!repo) throw new Error(`${id}: set CDKTN_MONOREPO to a cdk-terrain checkout (PR head).`)
   const cli = join(repo, "packages", "cdktn-cli")
   if (!existsSync(cli)) throw new Error(`${id}: ${cli} not found — is CDKTN_MONOREPO a cdk-terrain checkout?`)
 
-  // Build + pack the PR-head CLI. `package.sh` => dist/js/cdktn-cli-<v>.tgz.
-  console.log(`[${id}] building + packing cdktn-cli from ${repo} …`)
-  sh(PNPM, ["install", "--frozen-lockfile=false"], repo)
-  sh(PNPM, ["nx", "build", "cdktn-cli"], repo)
-  sh(PNPM, ["--filter", "cdktn-cli", "package"], repo)
-  const distJs = join(cli, "dist", "js")
-  const tgz = readdirSync(distJs).find((f) => f.endsWith(".tgz"))
-  if (!tgz) throw new Error(`${id}: no tarball in ${distJs}`)
-  const tarball = join(distJs, tgz)
+  // 1. Build + JS-package the WHOLE monorepo under its own toolchain. `nx reset`
+  //    is a critical cache-bust: nx can otherwise serve a stale bundle carried
+  //    across checkouts, silently validating the wrong code.
+  console.log(`[${id}] building monorepo at ${repo} (mise toolchain) …`)
+  const t0 = Date.now()
+  runInMonorepo(repo, [PNPM, "install", "--frozen-lockfile=false"])
+  runInMonorepo(repo, [PNPM, "nx", "reset"])
+  runInMonorepo(repo, [PNPM, "run", "build"])
+  runInMonorepo(repo, [PNPM, "run", "package:js"]) // → <repo>/dist/js/*.tgz
+  console.log(`[${id}] build done in ${((Date.now() - t0) / 1000).toFixed(0)}s`)
 
-  mkdirSync(sandbox, { recursive: true })
-  // The packed tarball pins workspace deps (@cdktn/*) at "0.0.0", which isn't on
-  // npm; override them to the published `next` line so the install resolves. The
-  // PR fix lives in cdktn-cli's bundle, not these native helpers, so this is faithful.
-  const CDKTN_PUBLISHED = process.env.CDKTN_PUBLISHED_VERSION || "0.24.0-pre.60"
-  writeFileSync(
-    join(sandbox, "package.json"),
-    JSON.stringify({
-      name: `sandbox-${id}`, private: true, version: "0.0.0",
-      overrides: {
-        "@cdktn/hcl-tools": CDKTN_PUBLISHED,
-        "@cdktn/hcl2json": CDKTN_PUBLISHED,
-        "@cdktn/hcl2cdk": CDKTN_PUBLISHED,
-      },
-    }, null, 2),
-  )
-  // Install the packed PR-head CLI tarball. Its externalised deps (cdktn, @cdktn/*,
-  // jsii, yargs, constructs) resolve from npm per cdktn-cli's own ranges — the PR's
-  // changes live inside cdktn-cli, so this faithfully exercises the PR head.
-  sh(NPM, ["install", "--no-fund", "--no-audit", tarball,
-    `${entry.libPackage}@${entry.libSpec}`, "constructs@^10.0.0"], sandbox)
+  const distJs = join(repo, "dist", "js")
+  const tarballs = readdirSync(distJs).filter((f) => f.endsWith(".tgz")).map((f) => join(distJs, f))
+  if (tarballs.length === 0) throw new Error(`${id}: no tarballs in ${distJs} after package:js`)
+
+  // 2. Boot Verdaccio and publish every workspace tarball (all at 0.0.0) to it.
+  const registry = await startRegistry(id)
+  try {
+    console.log(`[${id}] publishing ${tarballs.length} tarball(s) to ${registry.url}`)
+    // Async (shAsync): these run against the in-process Verdaccio — see shAsync.
+    for (const tarball of tarballs) {
+      await shAsync(NPM, ["publish", `--registry=${registry.url}`, registry.authArg, "--force", tarball])
+    }
+
+    // 3. Install cdktn-cli (+ the cdktn lib) from the local registry. Everything
+    //    cdktn* is 0.0.0=latest there; constructs proxies from npmjs. No version
+    //    overrides needed — Verdaccio serves the real 0.0.0.
+    mkdirSync(sandbox, { recursive: true })
+    writeFileSync(
+      join(sandbox, "package.json"),
+      JSON.stringify({ name: `sandbox-${id}`, private: true, version: "0.0.0" }, null, 2),
+    )
+    // cdktn-cli peer-deps cdktn@0.0.0; legacy-peer-deps avoids ERESOLVE.
+    writeRegistryNpmrc(sandbox, registry)
+    await shAsync(NPM, ["install", "--no-fund", "--no-audit",
+      "cdktn-cli", entry.libPackage, "constructs@^10.0.0"], sandbox)
+  } catch (err) {
+    await registry.close()
+    throw err
+  }
 
   const version = readInstalledVersion(sandbox, "cdktn-cli")
   const libVersion = readInstalledVersion(sandbox, entry.libPackage)
-  return { version: `${version}+prhead`, libVersion }
+  // Keep the registry UP so prepareFixtures can install `cdktn` from it too; the
+  // caller closes it afterwards.
+  return { version: `${version}+prhead`, libVersion, registry }
+}
+
+// Point a sandbox/fixture dir at the local Verdaccio registry, with the dummy
+// publish token and legacy-peer-deps (cdktn-cli peer-deps cdktn@0.0.0). The
+// host (127.0.0.1) must match the registry URL so npm applies the token.
+function writeRegistryNpmrc(dir, registry) {
+  writeFileSync(
+    join(dir, ".npmrc"),
+    [
+      `registry=${registry.url}`,
+      `//127.0.0.1:${registry.port}/:_authToken=dummy`,
+      "legacy-peer-deps=true",
+      "",
+    ].join("\n"),
+  )
 }
 
 function readInstalledVersion(sandbox, pkg) {
@@ -127,7 +249,7 @@ function readInstalledVersion(sandbox, pkg) {
   }
 }
 
-function prepareFixtures(id, entry, sandbox) {
+async function prepareFixtures(id, entry, sandbox, registry) {
   const dest = join(sandbox, "fixtures")
   rmSync(dest, { recursive: true, force: true })
   for (const name of FIXTURES) {
@@ -146,11 +268,18 @@ function prepareFixtures(id, entry, sandbox) {
       .replaceAll("__LIB_SPEC__", entry.libSpec)
     writeFileSync(join(to, "package.json"), pkg)
     rmSync(tmpl, { force: true })
-    sh(NPM, ["install", "--no-fund", "--no-audit"], to)
+    // For the monorepo (prhead) kind, resolve `cdktn` from the still-running
+    // local registry so the fixture's lib is the PR-head 0.0.0 build, not npm's.
+    // shAsync: the install talks to the in-process Verdaccio (see shAsync).
+    if (registry) writeRegistryNpmrc(to, registry)
+    await shAsync(NPM, ["install", "--no-fund", "--no-audit"], to)
+    // The fixture's deps are now installed; drop the .npmrc so it no longer
+    // references the ephemeral registry (gone after provisioning).
+    if (registry) rmSync(join(to, ".npmrc"), { force: true })
   }
 }
 
-function provisionOne(id) {
+async function provisionOne(id) {
   const base = MATRIX[id]
   if (!base) throw new Error(`Unknown id "${id}". Known: ${Object.keys(MATRIX).join(", ")}`)
   const entry = { ...base, monorepoPath: process.env.CDKTN_MONOREPO }
@@ -158,12 +287,28 @@ function provisionOne(id) {
   console.log(`\n=== provisioning ${id} (${entry.kind}) ===`)
   rmSync(sandbox, { recursive: true, force: true })
 
-  const { version, libVersion } =
-    entry.kind === "monorepo"
-      ? provisionMonorepo(id, entry, sandbox)
-      : provisionNpm(id, entry, sandbox)
+  // monorepo provisioning keeps a local Verdaccio registry up so fixtures install
+  // their `cdktn` lib from it too; tear it down once fixtures are prepared.
+  let registry = null
+  let version, libVersion
+  if (entry.kind === "monorepo") {
+    const r = await provisionMonorepo(id, entry, sandbox)
+    ;({ version, libVersion, registry } = r)
+  } else {
+    ;({ version, libVersion } = provisionNpm(id, entry, sandbox))
+  }
 
-  prepareFixtures(id, entry, sandbox)
+  try {
+    await prepareFixtures(id, entry, sandbox, registry)
+  } finally {
+    if (registry) await registry.close()
+  }
+
+  // Finalise the sandbox .npmrc: the ephemeral registry is gone now, so keep only
+  // legacy-peer-deps (cdktn-cli peer-deps cdktn@0.0.0) and drop the dead registry.
+  if (registry) {
+    writeFileSync(join(sandbox, ".npmrc"), "legacy-peer-deps=true\n")
+  }
 
   // Resolve the bin's JS entry (spawned cross-platform as `node <file>`), not the
   // platform .bin shim (a non-node-runnable .cmd/sh on Windows).
@@ -190,4 +335,4 @@ if (ids.length === 0) {
   console.error("usage: provision.mjs <id> [<id> ...]   ids: " + Object.keys(MATRIX).join(", "))
   process.exit(2)
 }
-for (const id of ids) provisionOne(id)
+for (const id of ids) await provisionOne(id)

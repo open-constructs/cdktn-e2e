@@ -174,3 +174,90 @@ real output, then tightened into exact matchers/snapshots:
 - Windows ConPTY: node-pty ships win32 prebuilds (no compiler needed). The bin is
   spawned as `node <bin-js>` (not the `.bin/*.cmd` shim) for cross-platform spawn;
   the `postinstall` chmod of the posix `spawn-helper` is skipped on Windows.
+
+## Known limitations (to fix later)
+
+1. **`cdktn-prhead` sibling fidelity.** `pnpm pack` of `cdktn-cli` yields a tarball
+   whose workspace deps (`@cdktn/cli-core`, `@cdktn/hcl*`, …) are pinned at `0.0.0`,
+   which isn't on npm; provision overrides them to the published `@next` line so the
+   standalone install resolves. This is faithful **only for changes inside
+   `cdktn-cli` itself** (where PR #264's UI rewrite lives). If a PR also changes a
+   sibling `@cdktn/*` package, the prhead run silently tests the published sibling,
+   not the PR's. Fix later: pack+install all changed workspace packages, or run the
+   bin directly out of the monorepo's own `node_modules` (workspace-resolved).
+2. **Sending Ctrl-C is a raw byte, not a signal — and that is faithful.** termless
+   exposes no `kill(signal)`; `press("Ctrl+c")` writes `\x03` to the PTY, byte-for-byte
+   what a keyboard sends. The outcome depends on the program's terminal mode, exactly
+   as on a real terminal:
+   - **At the inquirer prompt (raw mode):** `\x03` is delivered as a keypress; Node
+     `readline` fires `rl.on('SIGINT')`, which `@inquirer/core` wires to
+     `reject(new ExitPromptError(...))`. **Confirmed by isolated repro** — a plain
+     `@inquirer/prompts` `select` spawned over termless, then `press("Ctrl+c")`, exits
+     with `ExitPromptError`. So **R1 _is_ validatable** by the harness; the earlier
+     "can't validate" was an nx-cache-contaminated prhead build (stale AFTER bundle).
+   - **During `deploy --auto-approve` (cooked mode):** node-pty hardcodes the slave
+     PTY to cooked/ISIG-on/`VINTR=3`, so `\x03` → line-discipline → **group SIGINT**.
+     But cdktn **intercepts** that SIGINT (its own `AbortError`) and tears terraform
+     down cleanly, so terraform always reaches UNLOCK.
+3. **The in-process HTTP-backend mock does NOT reproduce #283.** Verified: a single
+   Ctrl-C during apply releases the lock on `cdktn-next` AND on `cdktn-latest@0.23.3`
+   (the exact version #283 was reported against) — and even a *double* Ctrl-C releases
+   it (cdktn's SIGINT interception never lets terraform hit the two-interrupt hard-kill
+   path). So the mock-based "#283 gate" has **no discrimination power** for the orphaned
+   lock and was re-scoped to an honest **clean-teardown smoke** (Ctrl-C during apply
+   must terminate without hanging and release the lock); the two-Ctrl-C control is
+   `test.skip`. Faithful #283 reproduction needs a **real locking backend** where
+   terraform can be hard-killed before unlocking (docker Postgres `pg` backend, or AWS
+   S3+DynamoDB) — that, plus `scripts/manual-verify.mjs`, is the way to verify #283.
+   (Earlier "stalls at Initializing the backend" was a *test* bug — waiting on
+   `"Still creating"` screen text cdktn never renders; fixed by gating on the mock's
+   `currentLock()`.)
+
+## Validation findings (2026-06-28, clean Verdaccio builds)
+
+The first real end-to-end validation produced two load-bearing results:
+
+1. **R1 fix does not work.** The harness is faithful for Ctrl-C at an inquirer prompt
+   (isolated repro: plain `@inquirer/prompts` `select` over termless + `press("Ctrl+c")`
+   → `ExitPromptError`). Against clean Verdaccio-built prhead at **both** `970e06d2`
+   and the fix commit **`27c12db2`**, R1 **hangs identically** — so `27c12db2` does
+   **not** resolve the Ctrl-C-at-approval-prompt hang. Bundle-level root cause: cdktn's
+   `StreamRenderer.start()` registers `process.once('SIGINT', cursorRestore)` that only
+   shows the cursor (no exit, never settles the void'd deploy promise) and absorbs the
+   interrupt before `select()` can raise `ExitPromptError` — so the patched catch in
+   `deploy.ts`/`destroy.ts` is never reached. That StreamRenderer code is identical in
+   both commits. **This is the suite catching a non-working fix** — its core purpose.
+   Confirm via `manual-verify.mjs` / a real terminal before reporting upstream.
+2. **#283 orphaned lock is not automatable via Ctrl-C.** A real-AWS prototype
+   (`aws_instance` t3.micro, created + hard-interrupted + tag-terminated) showed
+   terraform respects context-cancel near-instantly (graceful shutdown <350ms), so a
+   human-timed second Ctrl-C never reaches the "Two interrupts → skip unlock → orphan"
+   window. #283 is a wrapper signal-escalation race (or SIGKILL), not reproducible by
+   faithful keyboard input. The mock test is a clean-teardown smoke; faithful #283 is
+   `manual-verify.mjs` (real locking backend) + a cdktn unit test asserting it signals
+   terraform exactly once.
+
+## Update — #283 made testable + R1 manually confirmed (2026-06-28, pm)
+
+**R1 fix confirmed broken (manual ground-truth).** A human ran `cdktn deploy` on the
+prhead **fix build** (27c12db2) and pressed Ctrl-C at the approval prompt: the prompt
+did NOT cancel, subsequent arrow keys echoed literally (`^[[B`/`^[[A` — inquirer's
+keypress handler detached but the prompt promise never resolved → hung), and a 2nd
+Ctrl-C threw an **uncaught `AbortError`** (`handlers.js:229`, `process.i`) crashing the
+process. So commit 27c12db2's `ExitPromptError` catch is inert; the real failure is the
+StreamRenderer/AbortController path. The R1 e2e test stays red until truly fixed — a
+valid regression gate, now corroborated by manual testing.
+
+**#283 is testable after all (research-driven redesign).** Empirically on terraform
+1.7.5, the "two interrupts → orphaned lock" contract no longer holds (core still UNLOCKs
+on 2×SIGINT; only the provider plugin is SIGKILLed). The ONLY thing that orphans an
+*external* lock is SIGKILL. New `tests/ctrl-c-teardown.test.ts` #283 design:
+- **Positive control** (`src/raw-terraform.ts` + SIGKILL): raw terraform holds the mock
+  lock, we `kill("SIGKILL")` it mid-apply → lock orphaned. **Verified passing** — proves
+  the mock + assertions detect an orphan (the teeth the old design lacked).
+- **cdktn regression gate**: `cdktn deploy` + faithful Ctrl-C must RELEASE the lock; a
+  regression where cdktn SIGKILLs terraform's tree (the true #283 mechanism on modern
+  terraform) flips it to orphaned and fails.
+Faithful #283 root cause for upstream: on terraform ≥1.6 an orphaned lock requires a
+SIGKILL-equivalent — so if cdktn still orphans, it is killing terraform's process tree,
+not sending two SIGINTs. (The #283 reporter used terraform 1.5.5, possibly pre-change.)

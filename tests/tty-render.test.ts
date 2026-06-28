@@ -26,12 +26,15 @@ describe(`tty rendering [${currentCliId()}]`, () => {
     expect(exitedCleanly(await waitExit(term))).toBe(true)
   })
 
-  test("provider list: renders a bordered table box", async () => {
-    // The minimal fixture has no providers, so the table is empty — cli-table3 still
-    // draws the box corners (`┌`). Asserting the horizontal rule `─` is wrong for an
-    // empty table (corner-only box). A provider-bearing fixture would strengthen this.
-    const { term } = await spawnCli({ argv: ["provider", "list"], fixture: "minimal-ts", mode: "tty" })
-    await expect(term.screen).toContainText("┌", { timeout: 60_000 })
+  test("provider list: renders a cli-table3 with the declared providers", async () => {
+    // provider-list-ts declares hashicorp/random + hashicorp/null in cdktf.json;
+    // `provider list` reads the config directly (no download), so we get a real,
+    // non-empty bordered table with header + one row per provider.
+    const { term } = await spawnCli({ argv: ["provider", "list"], fixture: "provider-list-ts", mode: "tty" })
+    await expect(term.screen).toContainText("Provider Name", { timeout: 60_000 })
+    expect(term.screen).toContainText("random")
+    expect(term.screen).toContainText("null")
+    expect(term.screen).toContainText("─") // horizontal rule — proves a non-empty table
     expect(exitedCleanly(await waitExit(term))).toBe(true)
   })
 })

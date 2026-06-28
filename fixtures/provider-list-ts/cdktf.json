@@ -1,0 +1,7 @@
+{
+  "language": "typescript",
+  "app": "npx -y tsx main.ts",
+  "terraformProviders": ["hashicorp/random@~> 3.0", "hashicorp/null@~> 3.0"],
+  "terraformModules": [],
+  "context": {}
+}

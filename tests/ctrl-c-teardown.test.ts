@@ -1,7 +1,10 @@
 import { describe, test, expect, afterEach } from "vitest"
-import { spawnCli, waitExit } from "../src/harness.js"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { spawnCli, waitExit, until } from "../src/harness.js"
 import { currentCliId } from "../src/versions.js"
 import { startMockBackend, type MockBackend } from "../src/tf-http-backend.js"
+import { writeLockingTf, terraformInit, terraformApply } from "../src/raw-terraform.js"
 
 // Headline regression target. Two related Ctrl-C concerns:
 //  (R1) inquirer's ExitPromptError on Ctrl-C at the approval menu is NOT a non-TTY
@@ -39,9 +42,22 @@ describe(`ctrl-c teardown [${currentCliId()}]`, () => {
   })
 })
 
-// #283 reproduction — hermetic, via the in-process Terraform HTTP backend mock.
-// Drives a real terraform apply that holds the state lock (terraform_data + sleep),
-// interrupts it mid-flight, and asserts terraform was allowed to release the lock.
+// #283 state-lock coverage — hermetic, via the in-process Terraform HTTP backend mock.
+//
+// Research finding (terraform 1.7.5, empirically verified): the old "two interrupts →
+// orphaned lock" contract NO LONGER holds — modern terraform still calls UNLOCK even on
+// 2×SIGINT (the immediate-exit only SIGKILLs the *provider plugin*; core unwinds far
+// enough to release the backend lock). The ONLY thing that orphans an EXTERNAL lock is
+// SIGKILL (uncatchable death). So:
+//   • POSITIVE CONTROL — raw terraform + SIGKILL mid-apply → lock orphaned (proves the
+//     mock + assertions can actually detect an orphan).
+//   • cdktn REGRESSION — `cdktn deploy` + a faithful keyboard Ctrl-C must RELEASE the
+//     lock. cdktn would only orphan if it SIGKILLed terraform's tree on interrupt — the
+//     true #283 root cause to audit upstream.
+// Gate on `backend.currentLock()` (UI-independent): cdktn's StreamRenderer reformats
+// terraform's "Still creating"/"Gracefully shutting down" lines so they don't render.
+const LOCK_HOLD_SECONDS = 25
+
 describe(`#283 state-lock release [${currentCliId()}]`, () => {
   let backend: MockBackend | undefined
   afterEach(async () => {
@@ -49,41 +65,54 @@ describe(`#283 state-lock release [${currentCliId()}]`, () => {
     backend = undefined
   })
 
-  test("interrupting deploy mid-apply releases the lock (no stale lock)", async () => {
-    backend = await startMockBackend()
-    const env = {
-      TF_HTTP_ADDRESS: backend.address,
-      TF_HTTP_LOCK_ADDRESS: backend.lockAddress,
-      TF_HTTP_UNLOCK_ADDRESS: backend.unlockAddress,
-      LOCK_HOLD_SECONDS: "25",
-    }
+  // POSITIVE CONTROL: prove the mock detects an orphaned lock. Raw terraform (no cdktn)
+  // holds the lock, then we SIGKILL it mid-apply so its deferred UNLOCK never runs.
+  test("positive control: SIGKILL mid-apply orphans the lock (mock detects orphans)", async () => {
+    const b = (backend = await startMockBackend())
+    const dir = join(tmpdir(), "cdktn-e2e-283-sigkill")
+    writeLockingTf(dir, b, 15)
+    await terraformInit(dir)
+    const child = terraformApply(dir)
 
+    expect(await until(() => b.currentLock() !== null, 60_000),
+      "lock never acquired by raw terraform").toBe(true)
+    const t0 = Date.now()
+    child.kill("SIGKILL") // uncatchable — terraform dies without unlocking
+    await until(() => child.exitCode !== null || child.signalCode !== null, 10_000)
+    await new Promise((r) => setTimeout(r, 1_000))
+
+    expect(b.unlockedSince(t0), "SIGKILL must NOT release the lock").toBe(false)
+    expect(b.currentLock(), "expected an ORPHANED lock after SIGKILL").not.toBeNull()
+  })
+
+  // cdktn REGRESSION GATE: a faithful keyboard Ctrl-C during apply must let terraform
+  // shut down gracefully and release the lock — cdktn must NOT hard-kill terraform's
+  // tree (that would orphan the lock = #283). With the positive control above proving
+  // the mock catches orphans, this assertion now has teeth.
+  test("cdktn: single Ctrl-C during apply releases the lock (no orphan)", async () => {
+    const b = (backend = await startMockBackend())
     const { term } = await spawnCli({
       argv: ["deploy", "--auto-approve"],
       fixture: "locking-http-ts",
       mode: "tty",
-      env,
       freshState: true,
+      env: {
+        TF_HTTP_ADDRESS: b.address,
+        TF_HTTP_LOCK_ADDRESS: b.lockAddress,
+        TF_HTTP_UNLOCK_ADDRESS: b.unlockAddress,
+        LOCK_HOLD_SECONDS: String(LOCK_HOLD_SECONDS),
+      },
     })
-
-    // Wait until terraform is actually applying (lock acquired + sleep started).
-    await expect(term.screen).toContainText("Still creating", { timeout: 120_000 })
-    expect(backend.currentLock(), "lock should be held during apply").not.toBeNull()
+    expect(await until(() => b.currentLock() !== null, 120_000),
+      "apply never reached the lock-held state").toBe(true)
     const interruptedAt = Date.now()
-
     term.press("Ctrl+c")
 
-    // The whole point of #283: terraform must shut down gracefully and UNLOCK.
-    await expect(term.screen).toContainText("Gracefully shutting down", { timeout: 20_000 })
-    const exit = await waitExit(term, 30_000)
+    const exit = await waitExit(term, 40_000)
     expect(exit, "deploy hung after Ctrl-C during apply").not.toBeNull()
-
-    // Give the UNLOCK request a beat to arrive, then assert the lock was released.
     await new Promise((r) => setTimeout(r, 1_000))
-    expect(
-      backend.unlockedSince(interruptedAt),
-      "terraform was killed without releasing the state lock (issue #283)",
-    ).toBe(true)
-    expect(backend.currentLock()).toBeNull()
+    expect(b.unlockedSince(interruptedAt),
+      "cdktn left the lock orphaned after Ctrl-C (SIGKILLed terraform? — #283)").toBe(true)
+    expect(b.currentLock()).toBeNull()
   })
 })
