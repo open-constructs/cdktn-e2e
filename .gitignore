@@ -1,0 +1,11 @@
+node_modules/
+.sandboxes/
+*.tgz
+*.log
+coverage/
+artifacts/
+reports/
+_reports/
+.DS_Store
+# vitest may emit obsolete snapshots here during local runs
+__snapshots__/*.snap.new

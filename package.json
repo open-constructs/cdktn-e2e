@@ -1,0 +1,30 @@
+{
+  "name": "cdktn-cli-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone nightly/on-demand e2e harness that drives released cdktn-cli / cdktf-cli (and unmerged PR builds) over a real PTY with termless, to catch TTY/UX and CLI-contract regressions outside the cdk-terrain per-PR CI.",
+  "type": "module",
+  "engines": {
+    "node": ">=23.6.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "postinstall": "node scripts/fix-node-pty.mjs",
+    "provision": "node scripts/provision.mjs",
+    "check-preview": "node scripts/check-new-preview.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:smoke": "vitest run tests/smoke.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@termless/core": "^0.7.0",
+    "@termless/test": "^0.4.0",
+    "@termless/xtermjs": "^0.4.0",
+    "@termless/vt100": "^0.4.0",
+    "@types/node": "^22.10.0",
+    "node-pty": "^1.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  }
+}

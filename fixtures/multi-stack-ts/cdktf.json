@@ -1,0 +1,7 @@
+{
+  "language": "typescript",
+  "app": "npx -y tsx main.ts",
+  "terraformProviders": [],
+  "terraformModules": [],
+  "context": {}
+}

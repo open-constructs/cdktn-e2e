@@ -1,0 +1,22 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`synth golden output [cdktn-next] > minimal-ts cdk.tf.json is stable (sensitive output stays declared) 1`] = `
+{
+  "output": {
+    "greeting": {
+      "value": "hello from cdktn-cli-e2e",
+    },
+    "secret": {
+      "sensitive": true,
+      "value": "s3cr3t",
+    },
+  },
+  "terraform": {
+    "backend": {
+      "local": {
+        "path": "hello.tfstate",
+      },
+    },
+  },
+}
+`;

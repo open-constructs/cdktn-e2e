@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep the SHA-pinned action references current. Dependabot bumps both the
+  # pinned commit SHA and the trailing `# vX.Y.Z` comment when upstream releases.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # One PR per week for routine action bumps instead of N noisy PRs.
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
