@@ -6,6 +6,9 @@ coverage/
 artifacts/
 reports/
 _reports/
+# Pages build scratch (per-leg downloads + assembled site) — see nightly.yml pages job
+_dl/
+_site/
 .DS_Store
 # vitest may emit obsolete snapshots here during local runs
 __snapshots__/*.snap.new

@@ -213,6 +213,41 @@ real output, then tightened into exact matchers/snapshots:
    `"Still creating"` screen text cdktn never renders; fixed by gating on the mock's
    `currentLock()`.)
 
+## HTML report + GitHub Pages
+
+`scripts/build-report.mjs` turns **one** run's `reports/ci-report.json` (+
+`artifacts/` SVG/text) into a single self-contained HTML report (inline CSS/JS,
+embedded SVGs, no CDNs). The nightly `pages` job builds one such report **per matrix
+leg** (`_site/<os>-<cli_id>/index.html`) and a generated landing page
+(`scripts/build-index.mjs` → `_site/index.html`) that links to each leg with a
+pass/fail summary, then deploys the whole `_site/` to GitHub Pages via the **Actions
+build mode** on every cron/manual run. See `guides/running-tests.md` for usage and
+the one-time Pages setting.
+
+**No cross-leg data aggregation — by design.** An earlier version aggregated every
+`reports/raw/<id>/*.json` into a single cross-channel matrix; that was removed. Each
+report is built independently on a fresh CI artifact (nothing to merge), because the
+aggregation silently resurfaced stale runs (an old `posix_spawnp`-broken run overrode
+a fresh pass). The Pages landing page *links* the per-leg reports rather than merging
+their data, so comparison stays per-leg and honest.
+
+**Why a custom builder (and when to retire it).** On Vitest 4.1 (our pin) no
+out-of-the-box option covered our combination: the built-in `html` reporter needs
+`@vitest/ui`, emits a multi-file dev-server bundle (not one offline file), and
+inline-attachment + single-file support landed only in Vitest 5.0. termless itself
+ships no vitest reporter (only per-recording playback viewers). So the builder is
+justified for now.
+
+> **TODO (track): migrate to the native Vitest HTML reporter when 5.0 ships.**
+> Vitest 5.0 (currently **beta-only** — `npm dist-tags vitest` shows `latest: 4.1.x`)
+> adds `['html', { singleFile: true }]` (one self-contained file) and the
+> `context.annotate(msg, type, { body, contentType })` attachment API (Vitest 3.2+)
+> renders inline in that reporter. When 5.0 is GA, wire `src/setup.ts`'s
+> screenshot-on-failure to `context.annotate(...)` and drop most of
+> `build-report.mjs`. termless permits it today (`@termless/test` peers
+> `vitest >=2.0.0`); the only blocker is 5.0's beta status. We do **not** pin a beta
+> in a nightly regression harness.
+
 ## Validation findings (2026-06-28, clean Verdaccio builds)
 
 The first real end-to-end validation produced two load-bearing results:

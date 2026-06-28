@@ -67,6 +67,52 @@ want the report file.
 
 Failure artifacts (SVG + screen text of every spawned terminal) land in `artifacts/`.
 
+### HTML report
+
+```bash
+pnpm report:html                                              # → reports/html/index.html
+pnpm report:html -- --run-url "$ACTIONS_RUN_URL"             # link the GH Actions run
+pnpm report:html -- --report path/to/ci-report.json \        # point at a specific run
+  --artifacts path/to/svgs --out _site/index.html
+```
+
+`scripts/build-report.mjs` reads **one** run's `reports/ci-report.json` + the
+`artifacts/` SVG/text and emits a single self-contained `reports/html/index.html`
+(inline CSS/JS, SVGs embedded, no CDNs — works offline). It shows summary cards and
+a per-test table grouped by file → describe, with collapsible ANSI-stripped failure
+messages and inline terminal screenshots, plus status filters, duration sort, and a
+dark/light toggle. `reports/manual-verify-<id>.md` (below) is folded in when present.
+Under GitHub Actions the run link is auto-derived from `GITHUB_*` env if `--run-url`
+is omitted.
+
+It is **single-run by design** — no cross-channel aggregation. The nightly builds it
+on a fresh checkout (nothing to merge); flags `--report` / `--artifacts` / `--out`
+let CI point it at a specific downloaded leg. (A cross-channel matrix was removed
+deliberately; if you want to compare channels, build each report separately.)
+
+### GitHub Pages ("last run results")
+
+The nightly workflow's `pages` job publishes **one self-contained report per matrix
+leg** plus a landing page, on every cron run and manual re-trigger, so Pages always
+shows the latest run:
+
+```
+_site/index.html                          ← landing: a card per leg (pass/fail summary), built by build-index.mjs
+_site/<os>-<cli_id>/index.html            ← that leg's full report, built by build-report.mjs
+```
+
+No cross-leg *data* aggregation — each leg's report is built independently from its
+own downloaded `ci-report.json` (+ `svg-<leg>` screenshots); the landing page only
+links to them. It uses the **Actions build mode** (`upload-pages-artifact` +
+`deploy-pages`), not a legacy branch build. To preview the landing page locally:
+
+```bash
+node scripts/build-index.mjs --reports-dir _dl --site _site   # _dl holds report-<leg>/ci-report.json dirs
+```
+
+**One-time setup:** repo Settings → Pages → Source = "GitHub Actions". Never POST to
+the `pages/builds` API (forces a legacy Jekyll build of the branch root).
+
 ## 4. Manual Ctrl-C verification (the human ground-truth)
 
 Some Ctrl-C behaviours are confirmed by a human pressing the key. The guided runbook

@@ -12,6 +12,8 @@
     "postinstall": "node scripts/fix-node-pty.mjs",
     "provision": "node scripts/provision.mjs",
     "check-preview": "node scripts/check-new-preview.mjs",
+    "report:html": "node scripts/build-report.mjs",
+    "report:index": "node scripts/build-index.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:smoke": "vitest run tests/smoke.test.ts",

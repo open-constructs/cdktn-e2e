@@ -13,8 +13,8 @@ import { writeLockingTf, terraformInit, terraformApply } from "../src/raw-terraf
 //       the process must TERMINATE and restore the cursor.
 //  (#283) interrupting diff/deploy while terraform runs must let terraform shut down
 //       gracefully so the state lock is RELEASED — open-constructs/cdk-terrain#283.
-describe(`ctrl-c teardown [${currentCliId()}]`, () => {
-  test("R1: Ctrl-C at the approval menu terminates (does not hang) + restores cursor", async () => {
+describe(`Ctrl-C interrupt handling [${currentCliId()}]`, () => {
+  test("Ctrl-C at the deploy approval prompt exits cleanly and restores the cursor (PR #264 review concern)", async () => {
     const { term } = await spawnCli({ argv: ["deploy"], fixture: "minimal-ts", mode: "tty", freshState: true })
     await expect(term.screen).toContainText("Please review the diff output above", { timeout: 120_000 })
 
@@ -25,7 +25,7 @@ describe(`ctrl-c teardown [${currentCliId()}]`, () => {
     await expect(term.out).toContainOutput("\x1b[?25h", { timeout: 5_000 })
   })
 
-  test("watch --auto-approve: Ctrl-C tears down and restores the cursor", async () => {
+  test("Ctrl-C during watch --auto-approve tears down cleanly and restores the cursor", async () => {
     const { term } = await spawnCli({
       argv: ["watch", "--auto-approve"],
       fixture: "minimal-ts",
@@ -58,7 +58,7 @@ describe(`ctrl-c teardown [${currentCliId()}]`, () => {
 // terraform's "Still creating"/"Gracefully shutting down" lines so they don't render.
 const LOCK_HOLD_SECONDS = 25
 
-describe(`#283 state-lock release [${currentCliId()}]`, () => {
+describe(`terraform state-lock release on interrupt — issue #283 [${currentCliId()}]`, () => {
   let backend: MockBackend | undefined
   afterEach(async () => {
     await backend?.close()
@@ -67,7 +67,7 @@ describe(`#283 state-lock release [${currentCliId()}]`, () => {
 
   // POSITIVE CONTROL: prove the mock detects an orphaned lock. Raw terraform (no cdktn)
   // holds the lock, then we SIGKILL it mid-apply so its deferred UNLOCK never runs.
-  test("positive control: SIGKILL mid-apply orphans the lock (mock detects orphans)", async () => {
+  test("hard-killing terraform (SIGKILL) mid-apply leaves the state lock orphaned — sanity-checks the mock detects orphans", async () => {
     const b = (backend = await startMockBackend())
     const dir = join(tmpdir(), "cdktn-e2e-283-sigkill")
     writeLockingTf(dir, b, 15)
@@ -89,7 +89,7 @@ describe(`#283 state-lock release [${currentCliId()}]`, () => {
   // shut down gracefully and release the lock — cdktn must NOT hard-kill terraform's
   // tree (that would orphan the lock = #283). With the positive control above proving
   // the mock catches orphans, this assertion now has teeth.
-  test("cdktn: single Ctrl-C during apply releases the lock (no orphan)", async () => {
+  test("Ctrl-C during deploy lets terraform release the state lock (cdktn must not orphan it)", async () => {
     const b = (backend = await startMockBackend())
     const { term } = await spawnCli({
       argv: ["deploy", "--auto-approve"],

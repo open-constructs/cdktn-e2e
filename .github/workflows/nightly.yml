@@ -99,6 +99,68 @@ jobs:
           path: artifacts/
           if-no-files-found: ignore
 
+  # Publish "last run results" to GitHub Pages via the Actions build mode (NOT a
+  # legacy branch build). Each matrix leg gets its OWN self-contained report at
+  # _site/<leg>/index.html (no cross-leg data aggregation — build-report.mjs is
+  # single-run); a generated _site/index.html landing page links to each leg with a
+  # pass/fail summary (build-index.mjs). Each nightly cron or manual re-trigger
+  # overwrites the whole site, so Pages always reflects the latest run.
+  #
+  # One-time setup: repo Settings → Pages → Source = "GitHub Actions". Do NOT POST to
+  # the pages/builds API (that forces a legacy Jekyll build of the branch root).
+  pages:
+    needs: [decide, e2e]
+    if: always() && (needs.e2e.result == 'success' || needs.e2e.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write # deploy to GitHub Pages
+      id-token: write # OIDC token the deploy-pages action verifies
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Download this run's reports + screenshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download ${{ github.run_id }} --pattern 'report-*' --dir _dl || echo "no reports"
+          gh run download ${{ github.run_id }} --pattern 'svg-*' --dir _dl || echo "no screenshots"
+      - name: Build a self-contained report per leg + the landing index
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p _site
+          # One self-contained report per matrix leg → _site/<leg>/index.html.
+          # Each leg's report is built independently (no cross-leg data aggregation);
+          # svg-<leg> exists only when that leg had failures (else screenshots omitted).
+          for d in _dl/report-*/; do
+            [ -d "$d" ] || continue
+            leg=$(basename "$d"); leg=${leg#report-}
+            rep="$d/ci-report.json"
+            [ -f "$rep" ] || continue
+            art="_dl/svg-$leg"
+            [ -d "$art" ] || art="_dl/__no_artifacts__"
+            echo "Building report for leg: $leg"
+            node scripts/build-report.mjs --report "$rep" --artifacts "$art" --run-url "$RUN_URL" --out "_site/$leg/index.html"
+          done
+          # Landing page linking to each ./<leg>/ with a per-leg pass/fail summary.
+          node scripts/build-index.mjs --reports-dir _dl --site _site --run-url "$RUN_URL" --out _site/index.html
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
   # Surface failures as a dedup'd GitHub issue (the run-once policy means the cron
   # does NOT re-run failures; flakes are re-triggered manually via workflow_dispatch
   # force=true). One issue per cli_id, aggregated across OS legs. Recovery auto-closes.
@@ -126,8 +188,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           for id in cdktn-next cdktn-latest; do
-            files=$(ls _reports/report-*-$id/ci-report.json 2>/dev/null || true)
-            [ -n "$files" ] && node scripts/report-issue.mjs --cli-id "$id" --run-url "$RUN_URL" $files || echo "no report for $id"
+            files=()
+            for f in _reports/report-*-"$id"/ci-report.json; do
+              [ -e "$f" ] && files+=("$f")
+            done
+            if [ ${#files[@]} -gt 0 ]; then
+              node scripts/report-issue.mjs --cli-id "$id" --run-url "$RUN_URL" "${files[@]}"
+            else
+              echo "no report for $id"
+            fi
           done
 
   # Record the tested preview version so the next cron can diff against it.
