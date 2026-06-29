@@ -66,12 +66,16 @@ fixtures/              # minimal-ts, multi-stack-ts, locking-http-ts, provider-l
 tests/                 # smoke, tty-render, deploy-approve, non-tty, synth-golden, ctrl-c-teardown
 scripts/
   provision.mjs        # install/build a CLI into .sandboxes/<id>/ (+ Verdaccio for prhead)
+  fix-node-pty.mjs     # postinstall: restore node-pty's spawn-helper exec bit
   check-new-preview.mjs # cron diff-detection (skip when @next hasn't moved)
   report-issue.mjs     # open/update/close a dedup'd GitHub issue from a run
   step-summary.mjs     # per-run pass/fail table → GitHub step summary
+  build-report.mjs     # one run's ci-report.json + artifacts → self-contained HTML
+  build-index.mjs      # Pages landing page linking each matrix leg's report
   manual-verify.mjs    # human Ctrl-C runbook (ground-truth backstop)
-.github/workflows/     # nightly.yml (cron + diff-detection + issue reporting), pr-validation.yml
+.github/workflows/     # nightly.yml (cron + diff-detection + issue + Pages), pr-validation.yml
 ```
 
-See **[DESIGN.md](./DESIGN.md)** for architecture, rationale, the run-once CI policy,
-and the validation findings.
+See **[guides/DESIGN.md](./guides/DESIGN.md)** for architecture, rationale, and the
+run-once CI policy; **[guides/running-tests.md](./guides/running-tests.md)** for the
+operator runbook; **[guides/roadmap.md](./guides/roadmap.md)** for open items.

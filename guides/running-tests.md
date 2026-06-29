@@ -1,7 +1,8 @@
 # Running the e2e tests
 
 Everything you need to provision a CLI, run the suite, drive the manual Ctrl-C
-verification, and troubleshoot. For the *why*, see [../DESIGN.md](../DESIGN.md).
+verification, and troubleshoot. For the *why*, see [DESIGN.md](./DESIGN.md) and the
+open follow-ups in [roadmap.md](./roadmap.md).
 
 ## 0. Setup (once)
 
@@ -145,13 +146,17 @@ FX="$PWD/.sandboxes/cdktn-prhead/fixtures/minimal-ts"
 - **cdktn regression gate** — `cdktn deploy` + a faithful Ctrl-C must *release* the
   lock; a regression where cdktn SIGKILLs terraform's tree would orphan it and fail.
 
-These need `terraform` on PATH (mise provides it). No cloud creds.
+These need `terraform` on PATH (mise provides it). No cloud creds. The mock is a
+genuine backend (terraform's real HTTP-backend driver over a real socket; the HTTP
+REST backend is the one most TACOS expose), so there is **no fidelity reason** to
+reach for a cloud backend — see [DESIGN.md](./DESIGN.md).
 
-### Optional: real-AWS faithfulness probe (gated, creates billable infra)
+### A real-AWS probe is not needed (cleanup, in case one was run)
 
-The `aws_instance` create-wait does **not** reach the orphan path (terraform honours
-context-cancel in <350ms) — validated and documented in DESIGN.md. If you ever re-run
-such a probe, tag every resource `Purpose=cdktn-e2e-283-prototype` and clean up by tag:
+A `aws_instance` probe was tried once and does **not** reach the orphan path anyway
+(terraform honours context-cancel in <350ms), so it adds nothing over the hermetic
+tests. If anyone ever runs one, tag every resource `Purpose=cdktn-e2e-283-prototype`
+and clean up by tag:
 
 ```bash
 AV="AWS_REGION=us-east-1 aws-vault exec tcons-vincent --no-session --"

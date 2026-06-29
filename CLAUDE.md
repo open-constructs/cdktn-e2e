@@ -10,9 +10,10 @@ binary over a pseudo-terminal, feeds output into a headless xterm.js emulator, a
 asserts on the rendered screen, raw escape bytes, and exit codes. It runs nightly
 (and on demand) against **published preview releases** to catch TTY/UX + CLI-contract
 regressions that the cdk-terrain per-PR CI deliberately skips. It is **not** part of
-the cdk-terrain monorepo. See `DESIGN.md` for the full rationale + validation findings,
+the cdk-terrain monorepo. See `guides/DESIGN.md` for the full rationale,
 `guides/running-tests.md` for the operator runbook (provisioning, manual Ctrl-C
-verification, #283 lock tests, troubleshooting), and `README.md` for the quickstart.
+verification, #283 lock tests, troubleshooting), `guides/roadmap.md` for open items,
+and `README.md` for the quickstart.
 
 ## Commands
 
@@ -63,7 +64,10 @@ vitest ── @termless/test (matchers) ── @termless/core Terminal ── no
   channel. They use the legacy `cdktf.json` config and a **local backend** with no
   providers, so synth/deploy/destroy run fully offline.
 - **CI** (`.github/workflows/`): `nightly.yml` (cron + diff-detection + run-once
-  marker + GitHub-issue reporting), `pr-validation.yml` (on-demand PR-head build).
+  marker + GitHub-issue reporting + per-leg HTML report → GitHub Pages via
+  `build-report.mjs`/`build-index.mjs` + step summary), `pr-validation.yml`
+  (on-demand PR-head build). Matrix: 3 OS (ubuntu/macos/**windows**) × {cdktn-next,
+  cdktn-latest}.
 
 ## Critical gotchas (learned the hard way)
 
