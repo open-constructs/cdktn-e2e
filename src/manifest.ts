@@ -31,13 +31,46 @@ export function manifestPath(id: string): string {
 
 export function readManifest(id: string): ProvisionedCli {
   const p = manifestPath(id)
+  let cli: ProvisionedCli
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as ProvisionedCli
+    cli = JSON.parse(readFileSync(p, "utf8")) as ProvisionedCli
   } catch {
     throw new Error(
       `No provisioned sandbox for "${id}" at ${p}.\n` +
         `Run:  pnpm provision ${id}\n` +
         `(or set CLI_ID and run the matching provision step in CI).`,
+    )
+  }
+  assertManifestMatchesPrheadInstall(cli)
+  return cli
+}
+
+function readPackageVersion(sandboxDir: string, pkg: string): string {
+  const pkgJson = join(sandboxDir, "node_modules", pkg, "package.json")
+  return JSON.parse(readFileSync(pkgJson, "utf8")).version as string
+}
+
+function assertManifestMatchesPrheadInstall(cli: ProvisionedCli): void {
+  if (cli.id !== "cdktn-prhead") return
+
+  const cliVersion = readPackageVersion(cli.sandboxDir, "cdktn-cli")
+  const libVersion = readPackageVersion(cli.sandboxDir, cli.libPackage)
+  const expectedManifestVersion = `${cliVersion}+prhead`
+
+  if (cliVersion !== "0.0.0" || libVersion !== "0.0.0") {
+    throw new Error(
+      `cdktn-prhead sandbox is not using local PR-head artifacts: ` +
+        `cdktn-cli@${cliVersion}, ${cli.libPackage}@${libVersion}. ` +
+        `Run: pnpm provision cdktn-prhead`,
+    )
+  }
+
+  if (cli.version !== expectedManifestVersion || cli.libVersion !== libVersion) {
+    throw new Error(
+      `cdktn-prhead manifest is stale or inconsistent: ` +
+        `manifest cdktn-cli=${cli.version}, ${cli.libPackage}=${cli.libVersion}; ` +
+        `installed cdktn-cli=${cliVersion}, ${cli.libPackage}=${libVersion}. ` +
+        `Run: pnpm provision cdktn-prhead`,
     )
   }
 }
