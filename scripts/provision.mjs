@@ -29,7 +29,7 @@ import {
   readdirSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join, resolve, basename } from "node:path"
 import { fileURLToPath } from "node:url"
 import { runServer } from "verdaccio"
 
@@ -44,9 +44,10 @@ const MATRIX = {
   "cdktf-prefork": { kind: "npm", cliPackage: "cdktf-cli", cliSpec: "0.21.0", bin: "cdktf", libPackage: "cdktf", libSpec: "0.21.0" },
   "cdktn-latest":  { kind: "npm", cliPackage: "cdktn-cli", cliSpec: "latest", bin: "cdktn", libPackage: "cdktn", libSpec: "latest" },
   "cdktn-next":    { kind: "npm", cliPackage: "cdktn-cli", cliSpec: "next",   bin: "cdktn", libPackage: "cdktn", libSpec: "next" },
-  // libSpec "latest": Verdaccio serves the only published version (0.0.0) as
-  // `latest`, so the fixtures' `cdktn` resolves to the local PR-head build.
-  "cdktn-prhead":  { kind: "monorepo", bin: "cdktn", libPackage: "cdktn", libSpec: "latest" },
+  // Use the exact local workspace version for PR-head fixtures. A bare/latest
+  // install can fall through to the public npm release if registry metadata is
+  // resolved from the uplink, which would invalidate PR-head validation.
+  "cdktn-prhead":  { kind: "monorepo", bin: "cdktn", libPackage: "cdktn", libSpec: "0.0.0" },
 }
 
 // On Windows, npm/pnpm are .cmd shims that execFileSync can't resolve bare.
@@ -214,9 +215,14 @@ async function provisionMonorepo(id, entry, sandbox) {
       JSON.stringify({ name: `sandbox-${id}`, private: true, version: "0.0.0" }, null, 2),
     )
     // cdktn-cli peer-deps cdktn@0.0.0; legacy-peer-deps avoids ERESOLVE.
+    // Install local tarballs directly so npm cannot satisfy bare/latest/exact
+    // specs from the public uplink. Installing every workspace tarball top-level
+    // also satisfies internal @cdktn/* 0.0.0 dependencies from local artifacts.
     writeRegistryNpmrc(sandbox, registry)
     await shAsync(NPM, ["install", "--no-fund", "--no-audit",
-      "cdktn-cli", entry.libPackage, "constructs@^10.6.0"], sandbox)
+      ...tarballs, "constructs@^10.6.0"], sandbox)
+    assertPrheadLocalInstall(sandbox, "cdktn-cli")
+    assertPrheadLocalInstall(sandbox, entry.libPackage)
   } catch (err) {
     await registry.close()
     throw err
@@ -224,9 +230,14 @@ async function provisionMonorepo(id, entry, sandbox) {
 
   const version = readInstalledVersion(sandbox, "cdktn-cli")
   const libVersion = readInstalledVersion(sandbox, entry.libPackage)
-  // Keep the registry UP so prepareFixtures can install `cdktn` from it too; the
-  // caller closes it afterwards.
-  return { version: `${version}+prhead`, libVersion, registry }
+  // Keep the registry UP so prepareFixtures can install dependencies while it is
+  // still available; the caller closes it afterwards.
+  return {
+    version: `${version}+prhead`,
+    libVersion,
+    registry,
+    localLibTarball: tarballForPackage(tarballs, entry.libPackage),
+  }
 }
 
 // Point a sandbox/fixture dir at the local Verdaccio registry, with the dummy
@@ -253,7 +264,39 @@ function readInstalledVersion(sandbox, pkg) {
   }
 }
 
-async function prepareFixtures(id, entry, sandbox, registry) {
+function lockResolution(sandbox, pkg) {
+  try {
+    const lock = JSON.parse(readFileSync(join(sandbox, "package-lock.json"), "utf8"))
+    return lock.packages?.[`node_modules/${pkg}`]?.resolved || ""
+  } catch {
+    return ""
+  }
+}
+
+function assertPrheadLocalInstall(sandbox, pkg, expectedVersion = "0.0.0") {
+  const version = readInstalledVersion(sandbox, pkg)
+  if (version !== expectedVersion) {
+    throw new Error(`${pkg}: expected local PR-head version ${expectedVersion}, got ${version}`)
+  }
+
+  const resolved = lockResolution(sandbox, pkg)
+  if (resolved.includes("registry.npmjs.org")) {
+    throw new Error(`${pkg}: package-lock resolved to public npm (${resolved}); refusing to treat this as PR-head`)
+  }
+}
+
+function tarballForPackage(tarballs, pkg) {
+  const found = tarballs.find((tarball) => {
+    const name = basename(tarball)
+    return pkg === "cdktn"
+      ? name.startsWith("cdktn@0.0.0") || name === "cdktn-0.0.0.tgz"
+      : name === `${pkg}-0.0.0.tgz`
+  })
+  if (!found) throw new Error(`no local tarball found for ${pkg}`)
+  return found
+}
+
+async function prepareFixtures(id, entry, sandbox, registry, localLibTarball = null) {
   const dest = join(sandbox, "fixtures")
   rmSync(dest, { recursive: true, force: true })
   for (const name of FIXTURES) {
@@ -272,11 +315,18 @@ async function prepareFixtures(id, entry, sandbox, registry) {
       .replaceAll("__LIB_SPEC__", entry.libSpec)
     writeFileSync(join(to, "package.json"), pkg)
     rmSync(tmpl, { force: true })
-    // For the monorepo (prhead) kind, resolve `cdktn` from the still-running
-    // local registry so the fixture's lib is the PR-head 0.0.0 build, not npm's.
-    // shAsync: the install talks to the in-process Verdaccio (see shAsync).
+    // For the monorepo (prhead) kind, install the local lib tarball directly so
+    // fixture code also exercises the PR-head 0.0.0 build rather than npm's
+    // published release. shAsync: installs may talk to the in-process Verdaccio
+    // for transitive workspace dependencies (see shAsync).
     if (registry) writeRegistryNpmrc(to, registry)
-    await shAsync(NPM, ["install", "--no-fund", "--no-audit"], to)
+    if (localLibTarball) {
+      await shAsync(NPM, ["install", "--no-fund", "--no-audit", localLibTarball,
+        "constructs@^10.6.0", "tsx@^4.19.0", "typescript@^5.7.0"], to)
+      assertPrheadLocalInstall(to, entry.libPackage)
+    } else {
+      await shAsync(NPM, ["install", "--no-fund", "--no-audit"], to)
+    }
     // The fixture's deps are now installed; drop the .npmrc so it no longer
     // references the ephemeral registry (gone after provisioning).
     if (registry) rmSync(join(to, ".npmrc"), { force: true })
@@ -291,19 +341,19 @@ async function provisionOne(id) {
   console.log(`\n=== provisioning ${id} (${entry.kind}) ===`)
   rmSync(sandbox, { recursive: true, force: true })
 
-  // monorepo provisioning keeps a local Verdaccio registry up so fixtures install
-  // their `cdktn` lib from it too; tear it down once fixtures are prepared.
+  // monorepo provisioning keeps a local Verdaccio registry up until fixtures are
+  // prepared so any transitive workspace package lookups can still resolve locally.
   let registry = null
-  let version, libVersion
+  let version, libVersion, localLibTarball
   if (entry.kind === "monorepo") {
     const r = await provisionMonorepo(id, entry, sandbox)
-    ;({ version, libVersion, registry } = r)
+    ;({ version, libVersion, registry, localLibTarball } = r)
   } else {
     ;({ version, libVersion } = provisionNpm(id, entry, sandbox))
   }
 
   try {
-    await prepareFixtures(id, entry, sandbox, registry)
+    await prepareFixtures(id, entry, sandbox, registry, localLibTarball)
   } finally {
     if (registry) await registry.close()
   }
