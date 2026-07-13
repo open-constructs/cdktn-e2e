@@ -1,4 +1,4 @@
 {
   "_comment": "Updated by .github/workflows/nightly.yml after a green run. Drives cron diff-detection in scripts/check-new-preview.mjs.",
-  "cdktn-cli@next": "0.24.0-pre.77"
+  "cdktn-cli@next": "0.24.0-pre.79"
 }
